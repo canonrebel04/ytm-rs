@@ -117,6 +117,17 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         deeplink::push(code);
+    } else if let Some(query) = deeplink::from_play_args() {
+        // `ytm-rs://play?q=`: the running copy searches and plays the first song.
+        if deeplink::forward_play(&query) {
+            return Ok(());
+        }
+        deeplink::push_play(query);
+    } else if let Some(cmd) = deeplink::from_ctrl_args() {
+        if deeplink::forward_ctrl(&cmd) {
+            return Ok(());
+        }
+        deeplink::push_ctrl(cmd);
     } else if deeplink::forward_show() {
         return Ok(());
     }

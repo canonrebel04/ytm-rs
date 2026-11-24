@@ -1299,6 +1299,40 @@ impl App {
 
     // ---------------------------------------------------------------- navigation
 
+    /// `ytm-rs://play?q=`: search, then play the first song. Reuses the smoke hook in
+    /// `Resp::Search`, and plays at once when that search is already on screen.
+    fn play_query(&mut self, query: String) {
+        let q = query.trim().to_owned();
+        if q.is_empty() {
+            return;
+        }
+        if let Some(tracks) = self.search.as_ref().filter(|s| s.query == q && !s.tracks.is_empty()).map(|s| s.tracks.clone()) {
+            log::info!("play link: {}", tracks[0].title);
+            self.play_list(tracks, 0);
+            return;
+        }
+        self.smoke = Some(q.clone());
+        if self.page == Page::Search(q.clone()) {
+            self.backend.request(Req::Search(q));
+        } else {
+            self.go(Page::Search(q));
+        }
+    }
+
+    /// `ytm-rs://next`, `shuffle`, `liked`, and the other control links.
+    fn control_cmd(&mut self, cmd: &str) {
+        match cmd {
+            "next" => self.next(),
+            "prev" => self.prev(),
+            "shuffle" => self.toggle_shuffle(),
+            "pause" if self.playing() => self.toggle(),
+            "resume" if !self.playing() => self.toggle(),
+            "liked" => self.apply(Action::PlayCollection(Target::Playlist(LIKED_MUSIC.to_owned()), false)),
+            "liked-shuffle" => self.apply(Action::PlayCollection(Target::Playlist(LIKED_MUSIC.to_owned()), true)),
+            _ => {}
+        }
+    }
+
     fn go(&mut self, page: Page) {
         // An episode's show stands where a song's artist does; it opens as the playlist it is.
         let page = match page {
@@ -1674,6 +1708,14 @@ impl eframe::App for App {
         for code in crate::deeplink::take() {
             self.bring_back(ctx, wayland);
             jam::open_link(self, code);
+        }
+        for query in crate::deeplink::take_play() {
+            self.bring_back(ctx, wayland);
+            self.play_query(query);
+        }
+        for cmd in crate::deeplink::take_ctrl() {
+            self.bring_back(ctx, wayland);
+            self.control_cmd(&cmd);
         }
         for a in std::mem::take(&mut self.actions) {
             self.apply(a);

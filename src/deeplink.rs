@@ -10,11 +10,18 @@ use std::sync::Mutex;
 use crate::jam::normalize_code as normalize;
 
 static PENDING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Play queries (`ytm-rs://play?q=`) waiting for the UI, same shape as jam codes.
+static PENDING_PLAY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Control commands (`next`, `liked`, …) waiting for the UI.
+static PENDING_CTRL: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// A plain later launch asked for the window (see `forward_show`).
 static SHOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// What a plain later launch sends instead of a code.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 const SHOW_MSG: &str = "show";
+/// A play request from Jarvis or another launch: `play:` plus the search text.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+const PLAY_PREFIX: &str = "play:";
 /// Older versions' updater relaunches with this: the old copy may still be exiting, so
 /// don't hand over to it. (Relaunches now wait for it to exit: see `update::wait_for_predecessor`.)
 const RELAUNCH_FLAG: &str = "--relaunch";
@@ -50,6 +57,93 @@ pub fn parse(arg: &str) -> Option<String> {
     None
 }
 
+/// Search text in `ytm-rs://play?q=QUERY` or `ytm-rs://play/QUERY`.
+pub fn parse_play(arg: &str) -> Option<String> {
+    let arg = arg.trim().trim_matches('"');
+    let (scheme, rest) = arg.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("ytm-rs") {
+        return None;
+    }
+    let rest = rest.split('#').next().unwrap_or("");
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let path = path.trim_end_matches('/');
+    let (host, tail) = path.split_once('/').unwrap_or((path, ""));
+    if !host.eq_ignore_ascii_case("play") {
+        return None;
+    }
+    let raw = query_param(query, "q").unwrap_or(tail);
+    let text = percent_decode(raw).trim().to_owned();
+    (!text.is_empty() && text.len() <= 180).then_some(text)
+}
+
+fn percent_decode(raw: &str) -> String {
+    let raw = raw.replace('+', " ");
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The first play link among the process arguments.
+pub fn from_play_args() -> Option<String> {
+    std::env::args_os().skip(1).find_map(|a| parse_play(&a.to_string_lossy()))
+}
+
+/// A socket line that is a play request, not a jam code.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub fn play_message(msg: &str) -> Option<String> {
+    let q = msg.trim().strip_prefix(PLAY_PREFIX)?.trim();
+    (!q.is_empty() && q.len() <= 180).then(|| q.to_owned())
+}
+
+/// Transport and library commands: `ytm-rs://next`, `prev`, `shuffle`, `pause`,
+/// `resume`, `liked`, or `liked?shuffle=1`.
+pub fn parse_ctrl(arg: &str) -> Option<String> {
+    let arg = arg.trim().trim_matches('"');
+    let (scheme, rest) = arg.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("ytm-rs") {
+        return None;
+    }
+    let rest = rest.split('#').next().unwrap_or("");
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let host = path.trim_end_matches('/').split('/').next().unwrap_or("");
+    let shuffle = query_param(query, "shuffle").is_some_and(|v| matches!(v, "1" | "true" | "on"));
+    Some(match host.to_ascii_lowercase().as_str() {
+        "next" | "skip" => "next".to_owned(),
+        "prev" | "previous" => "prev".to_owned(),
+        "shuffle" => "shuffle".to_owned(),
+        "pause" => "pause".to_owned(),
+        "resume" | "play" if query_param(query, "q").is_none() => "resume".to_owned(),
+        "liked" | "likes" => {
+            if shuffle { "liked-shuffle".to_owned() } else { "liked".to_owned() }
+        }
+        _ => return None,
+    })
+}
+
+/// The first control link among the process arguments.
+pub fn from_ctrl_args() -> Option<String> {
+    std::env::args_os().skip(1).find_map(|a| parse_ctrl(&a.to_string_lossy()))
+}
+
+/// A socket line that is a control command.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+pub fn ctrl_message(msg: &str) -> Option<String> {
+    let cmd = msg.trim().strip_prefix("ctrl:")?.trim();
+    matches!(cmd, "next" | "prev" | "shuffle" | "pause" | "resume" | "liked" | "liked-shuffle").then(|| cmd.to_owned())
+}
+
 fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
@@ -67,9 +161,27 @@ pub fn push(code: String) {
     PENDING.lock().unwrap().push(code);
 }
 
+pub fn push_play(query: String) {
+    PENDING_PLAY.lock().unwrap().push(query);
+}
+
+pub fn push_ctrl(cmd: String) {
+    PENDING_CTRL.lock().unwrap().push(cmd);
+}
+
 /// Codes received since the last call, oldest first.
 pub fn take() -> Vec<String> {
     std::mem::take(&mut *PENDING.lock().unwrap())
+}
+
+/// Play queries received since the last call, oldest first.
+pub fn take_play() -> Vec<String> {
+    std::mem::take(&mut *PENDING_PLAY.lock().unwrap())
+}
+
+/// Control commands received since the last call, oldest first.
+pub fn take_ctrl() -> Vec<String> {
+    std::mem::take(&mut *PENDING_CTRL.lock().unwrap())
 }
 
 /// Whether a later launch asked for the window since the last call.
@@ -93,6 +205,23 @@ pub fn forward_show() -> bool {
         let _ = AllowSetForegroundWindow(ASFW_ANY);
     }
     forward_to_running(SHOW_MSG)
+}
+
+/// Hand a play query to a running instance. True if one took it.
+pub fn forward_play(query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() || q.len() > 180 {
+        return false;
+    }
+    forward_to_running(&format!("{PLAY_PREFIX}{q}"))
+}
+
+/// Hand a control command to a running instance. True if one took it.
+pub fn forward_ctrl(cmd: &str) -> bool {
+    if ctrl_message(&format!("ctrl:{cmd}")).is_none() {
+        return false;
+    }
+    forward_to_running(&format!("ctrl:{cmd}"))
 }
 
 /// Per-user pipe name. A dev profile (`YTM_DATA_DIR`) gets its own, so test runs
@@ -273,6 +402,18 @@ mod unix {
                 wake();
                 continue;
             }
+            if let Some(query) = super::play_message(msg) {
+                log::info!("play request from another launch");
+                super::push_play(query);
+                wake();
+                continue;
+            }
+            if let Some(cmd) = super::ctrl_message(msg) {
+                log::info!("control request from another launch: {cmd}");
+                super::push_ctrl(cmd);
+                wake();
+                continue;
+            }
             match normalize(msg) {
                 Some(code) => {
                     log::info!("jam link received from another launch: {code}");
@@ -391,6 +532,18 @@ mod win {
                 wake();
                 continue;
             }
+            if let Some(query) = super::play_message(String::from_utf8_lossy(&msg).trim()) {
+                log::info!("play request from another launch");
+                super::push_play(query);
+                wake();
+                continue;
+            }
+            if let Some(cmd) = super::ctrl_message(String::from_utf8_lossy(&msg).trim()) {
+                log::info!("control request from another launch: {cmd}");
+                super::push_ctrl(cmd);
+                wake();
+                continue;
+            }
             match normalize(String::from_utf8_lossy(&msg).trim()) {
                 Some(code) => {
                     log::info!("jam link received from another launch: {code}");
@@ -450,6 +603,24 @@ mod tests {
         assert_eq!(parse("YTM-RS://JAM/aBc234").as_deref(), Some("ABC234"));
         assert_eq!(parse("\"ytm-rs://jam/ABC234\"").as_deref(), Some("ABC234"));
         assert_eq!(parse("ytm-rs://jam/?c=xyz789").as_deref(), Some("XYZ789"));
+    }
+
+    #[test]
+    fn play_link() {
+        assert_eq!(parse_play("ytm-rs://play?q=boards%20of%20canada").as_deref(), Some("boards of canada"));
+        assert_eq!(parse_play("ytm-rs://play/Roygbiv").as_deref(), Some("Roygbiv"));
+        assert_eq!(parse_play("\"ytm-rs://play?q=tea\"").as_deref(), Some("tea"));
+        assert_eq!(play_message("play:Roygbiv").as_deref(), Some("Roygbiv"));
+        assert!(parse_play("ytm-rs://jam/ABC234").is_none());
+        assert!(parse("ytm-rs://play?q=tea").is_none());
+        assert!(play_message("show").is_none());
+        assert_eq!(parse_ctrl("ytm-rs://liked").as_deref(), Some("liked"));
+        assert_eq!(parse_ctrl("ytm-rs://liked?shuffle=1").as_deref(), Some("liked-shuffle"));
+        assert_eq!(parse_ctrl("ytm-rs://next").as_deref(), Some("next"));
+        assert_eq!(parse_ctrl("ytm-rs://previous").as_deref(), Some("prev"));
+        assert_eq!(parse_ctrl("ytm-rs://shuffle").as_deref(), Some("shuffle"));
+        assert_eq!(ctrl_message("ctrl:liked-shuffle").as_deref(), Some("liked-shuffle"));
+        assert!(parse_ctrl("ytm-rs://play?q=tea").is_none());
     }
 
     #[test]
