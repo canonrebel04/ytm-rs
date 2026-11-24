@@ -1710,11 +1710,9 @@ impl eframe::App for App {
             jam::open_link(self, code);
         }
         for query in crate::deeplink::take_play() {
-            self.bring_back(ctx, wayland);
             self.play_query(query);
         }
         for cmd in crate::deeplink::take_ctrl() {
-            self.bring_back(ctx, wayland);
             self.control_cmd(&cmd);
         }
         for a in std::mem::take(&mut self.actions) {

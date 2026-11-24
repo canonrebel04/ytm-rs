@@ -141,6 +141,7 @@ fn main() -> eframe::Result {
     // Dev hook: YTM_BACKGROUND opens the window off-screen, unfocused and off the
     // taskbar, so automated test runs don't pop up over whatever the user is doing.
     let background = std::env::var_os("YTM_BACKGROUND").is_some();
+    let no_focus = std::env::var_os("YTM_NO_FOCUS").is_some();
     ui::init_titlebar(&data_dir());
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("YT Music")
@@ -158,6 +159,9 @@ fn main() -> eframe::Result {
         .with_icon(appicon::get(appicon::load(&data_dir())).icon_data().expect("bundled icons are valid PNGs"));
     if background {
         viewport = viewport.with_position([-4000.0, 0.0]).with_inner_size([1920.0, 1057.0]).with_active(false).with_taskbar(false);
+    } else if no_focus {
+        // Jarvis playback: don't steal the desktop or the voice follow-up.
+        viewport = viewport.with_active(false);
     }
     let renderer = renderer::init(&data_dir());
     // Both, so each settles this run's choice.
